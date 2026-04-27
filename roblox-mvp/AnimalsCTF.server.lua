@@ -1,14 +1,13 @@
 -- Server Script: paste into ServerScriptService as a single Script named "AnimalsCTF"
--- Animals CTF — minimal single-file MVP.
--- Creates teams, auto-builds the arena, handles flag pickup/drop/return/score,
--- match timer, win condition, respawn. No client scripts needed; uses
--- Roblox's built-in leaderstats for the scoreboard.
+-- Animals CTF — Phase A MVP (bots + melee attack + F-key fix)
+-- Also add roblox-mvp/AttackInput.client.lua to StarterPlayerScripts.
 
 local Players           = game:GetService("Players")
 local Teams             = game:GetService("Teams")
 local Workspace         = game:GetService("Workspace")
 local RunService        = game:GetService("RunService")
 local CollectionService = game:GetService("CollectionService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
 
 ------------------------------------------------------------------
 -- Config
@@ -18,6 +17,41 @@ local ROUND_SECONDS       = 180
 local INTERMISSION        = 8
 local CAPTURE_RADIUS      = 10
 local ARENA_SIZE          = Vector3.new(200, 2, 140)
+
+-- Attack
+local ATTACK_RANGE    = 8     -- studs to hit
+local ATTACK_DAMAGE   = 20
+local ATTACK_COOLDOWN = 0.6   -- seconds between swings per player
+
+-- Bots
+local BOTS_PER_TEAM  = 3
+local SIGHT_RADIUS   = 80
+local THINK_INTERVAL = 0.3
+local RESPAWN_DELAY  = 4
+
+------------------------------------------------------------------
+-- Animal roster (inline — no module required)
+------------------------------------------------------------------
+local ANIMALS = {
+	{ id = "lion",     emoji = "🦁", speed = 22, hp = 120, atk = 22, range = 8 },
+	{ id = "elephant", emoji = "🐘", speed = 14, hp = 220, atk = 28, range = 9 },
+	{ id = "fox",      emoji = "🦊", speed = 32, hp = 80,  atk = 14, range = 7 },
+	{ id = "gorilla",  emoji = "🦍", speed = 18, hp = 180, atk = 26, range = 8 },
+	{ id = "kangaroo", emoji = "🦘", speed = 26, hp = 110, atk = 18, range = 7 },
+	{ id = "cheetah",  emoji = "🐆", speed = 36, hp = 75,  atk = 15, range = 7 },
+	{ id = "bear",     emoji = "🐻", speed = 20, hp = 170, atk = 24, range = 8 },
+}
+local TEAM_COLORS = {
+	Blue = BrickColor.new("Bright blue"),
+	Red  = BrickColor.new("Really red"),
+}
+
+------------------------------------------------------------------
+-- RemoteEvent for player attack (client → server)
+------------------------------------------------------------------
+local AttackFired = Instance.new("RemoteEvent")
+AttackFired.Name   = "AttackFired"
+AttackFired.Parent = ReplicatedStorage
 
 ------------------------------------------------------------------
 -- Teams
@@ -130,7 +164,7 @@ buildBase("Red",  BrickColor.new("Really red"),   W/2 - 20)
 ------------------------------------------------------------------
 -- Game state
 ------------------------------------------------------------------
-local phase = "playing"  -- "playing" | "ended"
+local phase = "playing"
 local timeLeft = ROUND_SECONDS
 local scores = { Blue = 0, Red = 0 }
 
@@ -213,8 +247,8 @@ local function resetRound()
 		p:LoadCharacter()
 		local ls = p:FindFirstChild("leaderstats")
 		if ls then
-			ls:FindFirstChild("Blue").Value = 0
-			ls:FindFirstChild("Red").Value = 0
+			if ls:FindFirstChild("Blue") then ls.Blue.Value = 0 end
+			if ls:FindFirstChild("Red")  then ls.Red.Value  = 0 end
 		end
 	end
 end
@@ -263,7 +297,7 @@ local function awardScore(team)
 	if scores[team] >= SCORE_LIMIT then endRound(team) end
 end
 
--- capture check
+-- Capture check
 RunService.Heartbeat:Connect(function()
 	if phase ~= "playing" then return end
 	for _, f in ipairs(CollectionService:GetTagged("Flag")) do
@@ -285,7 +319,7 @@ RunService.Heartbeat:Connect(function()
 	end
 end)
 
--- timer
+-- Timer
 task.spawn(function()
 	while #Players:GetPlayers() == 0 do task.wait(1) end
 	task.wait(3)
@@ -307,8 +341,9 @@ end)
 ------------------------------------------------------------------
 -- Player join / team balance / leaderstats
 ------------------------------------------------------------------
+local lastAttackTimes = {}
+
 Players.PlayerAdded:Connect(function(player)
-	-- team balance
 	local b, r = 0, 0
 	for _, p in ipairs(Players:GetPlayers()) do
 		if p ~= player and p.Team then
@@ -320,7 +355,6 @@ Players.PlayerAdded:Connect(function(player)
 	player.Team = team
 	player.TeamColor = team.TeamColor
 
-	-- leaderstats for built-in scoreboard
 	local ls = Instance.new("Folder")
 	ls.Name = "leaderstats"
 	ls.Parent = player
@@ -337,10 +371,226 @@ Players.PlayerAdded:Connect(function(player)
 end)
 
 Players.PlayerRemoving:Connect(function(player)
+	lastAttackTimes[player.UserId] = nil
 	if player.Character then
 		local hrp = player.Character:FindFirstChild("HumanoidRootPart")
 		if hrp then dropHeldBy(player.UserId, hrp.Position) end
 	end
 end)
 
-print("[AnimalsCTF] Ready. Good luck, have fun.")
+------------------------------------------------------------------
+-- Player attack handler (F key fires AttackFired from client)
+------------------------------------------------------------------
+local bots = {}  -- populated below
+
+AttackFired.OnServerEvent:Connect(function(player)
+	if phase ~= "playing" then return end
+	if not player.Character or not player.Team then return end
+
+	local now = tick()
+	if (now - (lastAttackTimes[player.UserId] or 0)) < ATTACK_COOLDOWN then return end
+	lastAttackTimes[player.UserId] = now
+
+	local hrp = player.Character:FindFirstChild("HumanoidRootPart")
+	if not hrp then return end
+
+	-- Hit enemy players
+	for _, target in ipairs(Players:GetPlayers()) do
+		if target ~= player and target.Team and target.Team.Name ~= player.Team.Name then
+			if target.Character then
+				local tHrp = target.Character:FindFirstChild("HumanoidRootPart")
+				local tHum = target.Character:FindFirstChildOfClass("Humanoid")
+				if tHrp and tHum and tHum.Health > 0 then
+					if (tHrp.Position - hrp.Position).Magnitude <= ATTACK_RANGE then
+						tHum:TakeDamage(ATTACK_DAMAGE)
+						tHrp.AssemblyLinearVelocity = (tHrp.Position - hrp.Position).Unit * 30 + Vector3.new(0, 10, 0)
+					end
+				end
+			end
+		end
+	end
+
+	-- Hit enemy bots
+	for _, bot in ipairs(bots) do
+		if bot.Parent and bot:GetAttribute("Team") ~= player.Team.Name then
+			local bHrp = bot.PrimaryPart
+			local bHum = bot:FindFirstChildOfClass("Humanoid")
+			if bHrp and bHum and bHum.Health > 0 then
+				if (bHrp.Position - hrp.Position).Magnitude <= ATTACK_RANGE then
+					bHum:TakeDamage(ATTACK_DAMAGE)
+				end
+			end
+		end
+	end
+end)
+
+------------------------------------------------------------------
+-- Bot system (AI teammates)
+-- Bots wander toward enemy base, chase nearest enemy, attack melee.
+-- Tuning: BOTS_PER_TEAM / SIGHT_RADIUS / THINK_INTERVAL / RESPAWN_DELAY
+------------------------------------------------------------------
+local function randomAnimal()
+	return ANIMALS[math.random(1, #ANIMALS)]
+end
+
+local function buildBotRig(animal, teamName)
+	local model = Instance.new("Model")
+	model.Name = "Bot_" .. animal.id
+
+	local hrp = Instance.new("Part")
+	hrp.Name = "HumanoidRootPart"
+	hrp.Size = Vector3.new(2, 2, 1)
+	hrp.BrickColor = TEAM_COLORS[teamName] or TEAM_COLORS.Blue
+	hrp.Material = Enum.Material.SmoothPlastic
+	hrp.TopSurface = Enum.SurfaceType.Smooth
+	hrp.BottomSurface = Enum.SurfaceType.Smooth
+	hrp.CanCollide = true
+	hrp.Parent = model
+	model.PrimaryPart = hrp
+
+	local head = Instance.new("Part")
+	head.Name = "Head"
+	head.Size = Vector3.new(1.2, 1.2, 1.2)
+	head.BrickColor = hrp.BrickColor
+	head.CFrame = hrp.CFrame * CFrame.new(0, 1.6, 0)
+	head.Parent = model
+	local hw = Instance.new("WeldConstraint")
+	hw.Part0, hw.Part1 = hrp, head
+	hw.Parent = head
+
+	local hum = Instance.new("Humanoid")
+	hum.WalkSpeed = animal.speed
+	hum.MaxHealth = animal.hp
+	hum.Health = animal.hp
+	hum.Parent = model
+
+	local bb = Instance.new("BillboardGui")
+	bb.Size = UDim2.new(0, 60, 0, 60)
+	bb.StudsOffset = Vector3.new(0, 2.5, 0)
+	bb.AlwaysOnTop = true
+	bb.Parent = head
+	local lbl = Instance.new("TextLabel")
+	lbl.Size = UDim2.new(1, 0, 1, 0)
+	lbl.BackgroundTransparency = 1
+	lbl.Text = animal.emoji
+	lbl.TextScaled = true
+	lbl.Font = Enum.Font.SourceSansBold
+	lbl.Parent = bb
+
+	CollectionService:AddTag(model, "Bot")
+	model:SetAttribute("Team", teamName)
+	model:SetAttribute("AnimalId", animal.id)
+	model:SetAttribute("AnimalRange", animal.range)
+	model:SetAttribute("AnimalAtk", animal.atk)
+	model:SetAttribute("LastAttack", 0)
+
+	return model, hum
+end
+
+local spawnBot
+spawnBot = function(teamName)
+	local animal = randomAnimal()
+	local rig, hum = buildBotRig(animal, teamName)
+	local plate = getPlate(teamName)
+	rig.Parent = Workspace
+	if plate then
+		local jitter = Vector3.new(math.random(-6, 6), 4, math.random(-6, 6))
+		rig:PivotTo(CFrame.new(plate.Position + jitter))
+	end
+	table.insert(bots, rig)
+
+	hum.Died:Connect(function()
+		for i, b in ipairs(bots) do
+			if b == rig then table.remove(bots, i); break end
+		end
+		task.wait(RESPAWN_DELAY)
+		if rig.Parent then rig:Destroy() end
+		spawnBot(teamName)
+	end)
+end
+
+local function findBotTarget(bot)
+	local hrp = bot.PrimaryPart
+	if not hrp then return nil, math.huge end
+	local myTeam = bot:GetAttribute("Team")
+	local best, bestDist = nil, SIGHT_RADIUS
+
+	for _, p in ipairs(Players:GetPlayers()) do
+		if p.Team and p.Team.Name ~= myTeam and p.Character then
+			local pHrp = p.Character:FindFirstChild("HumanoidRootPart")
+			local pHum = p.Character:FindFirstChildOfClass("Humanoid")
+			if pHrp and pHum and pHum.Health > 0 then
+				local d = (pHrp.Position - hrp.Position).Magnitude
+				if d < bestDist then best = pHrp; bestDist = d end
+			end
+		end
+	end
+	for _, b in ipairs(bots) do
+		if b ~= bot and b:GetAttribute("Team") ~= myTeam then
+			local bHrp = b.PrimaryPart
+			local bHum = b:FindFirstChildOfClass("Humanoid")
+			if bHrp and bHum and bHum.Health > 0 then
+				local d = (bHrp.Position - hrp.Position).Magnitude
+				if d < bestDist then best = bHrp; bestDist = d end
+			end
+		end
+	end
+	return best, bestDist
+end
+
+local function botTick(bot)
+	local hum = bot:FindFirstChildOfClass("Humanoid")
+	local hrp = bot.PrimaryPart
+	if not hum or not hrp or hum.Health <= 0 then return end
+
+	local target, dist = findBotTarget(bot)
+	if not target then
+		local enemyPlate = getPlate(bot:GetAttribute("Team") == "Blue" and "Red" or "Blue")
+		if enemyPlate then
+			hum:MoveTo(enemyPlate.Position + Vector3.new(math.random(-8, 8), 0, math.random(-8, 8)))
+		end
+		return
+	end
+
+	hum:MoveTo(target.Position)
+
+	local range = bot:GetAttribute("AnimalRange") or 8
+	local atk   = bot:GetAttribute("AnimalAtk")   or 20
+	if dist <= range + 2 then
+		local last = bot:GetAttribute("LastAttack")
+		if tick() - last >= ATTACK_COOLDOWN then
+			bot:SetAttribute("LastAttack", tick())
+			local tHum = target.Parent:FindFirstChildOfClass("Humanoid")
+			if tHum and tHum.Health > 0 then
+				tHum:TakeDamage(atk)
+				target.AssemblyLinearVelocity = (target.Position - hrp.Position).Unit * 30 + Vector3.new(0, 10, 0)
+			end
+		end
+	end
+end
+
+local botAccum = 0
+RunService.Heartbeat:Connect(function(dt)
+	botAccum = botAccum + dt
+	if botAccum < THINK_INTERVAL then return end
+	botAccum = 0
+	for _, bot in ipairs(bots) do
+		if bot.Parent then botTick(bot) end
+	end
+end)
+
+-- Spawn initial bots once the arena is ready
+task.spawn(function()
+	while #CollectionService:GetTagged("Base") < 2 do task.wait(0.1) end
+	task.wait(2)
+	if BOTS_PER_TEAM > 0 then
+		for _, teamName in ipairs({"Blue", "Red"}) do
+			for _ = 1, BOTS_PER_TEAM do
+				spawnBot(teamName)
+				task.wait(0.3)
+			end
+		end
+	end
+end)
+
+print("[AnimalsCTF] Phase A ready — bots enabled, F-key attack active.")

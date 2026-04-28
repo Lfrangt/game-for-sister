@@ -1,6 +1,7 @@
 -- Server Script: paste into ServerScriptService as a single Script named "AnimalsCTF"
--- Animals CTF — Phase A MVP (bots + melee attack + F-key fix)
--- Also add roblox-mvp/AttackInput.client.lua to StarterPlayerScripts.
+-- Animals CTF — Phase A MVP (bots + melee attack + F-key fix + sounds)
+-- Also add roblox-mvp/AttackInput.client.lua and roblox-mvp/SoundManager.client.lua
+-- to StarterPlayerScripts.
 
 local Players           = game:GetService("Players")
 local Teams             = game:GetService("Teams")
@@ -47,11 +48,18 @@ local TEAM_COLORS = {
 }
 
 ------------------------------------------------------------------
--- RemoteEvent for player attack (client → server)
+-- RemoteEvents
 ------------------------------------------------------------------
 local AttackFired = Instance.new("RemoteEvent")
 AttackFired.Name   = "AttackFired"
 AttackFired.Parent = ReplicatedStorage
+
+-- SoundEvent: server notifies all clients of game events for sound playback
+-- Payload: (eventName: string, arg: string?)
+-- Events: "flagPickup", "flagReturn", "score", "death"
+local SoundEvent = Instance.new("RemoteEvent")
+SoundEvent.Name   = "SoundEvent"
+SoundEvent.Parent = ReplicatedStorage
 
 ------------------------------------------------------------------
 -- Teams
@@ -230,8 +238,10 @@ for _, flag in ipairs(CollectionService:GetTagged("Flag")) do
 			flag:SetAttribute("CarrierUserId", plr.UserId)
 			flag:SetAttribute("AtHome", false)
 			attach(flag, char)
+			SoundEvent:FireAllClients("flagPickup", pTeam)
 		elseif not flag:GetAttribute("AtHome") then
 			returnHome(flag)
+			SoundEvent:FireAllClients("flagReturn", fTeam)
 		end
 	end)
 end
@@ -294,6 +304,7 @@ end
 local function awardScore(team)
 	scores[team] = scores[team] + 1
 	updateLeaderstats()
+	SoundEvent:FireAllClients("score", team)
 	if scores[team] >= SCORE_LIMIT then endRound(team) end
 end
 
@@ -366,6 +377,7 @@ Players.PlayerAdded:Connect(function(player)
 		hum.Died:Connect(function()
 			local hrp = char:FindFirstChild("HumanoidRootPart")
 			if hrp then dropHeldBy(player.UserId, hrp.Position) end
+			SoundEvent:FireClient(player, "death")
 		end)
 	end)
 end)
